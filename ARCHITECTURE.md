@@ -13,10 +13,16 @@ milliseconds (no Node process to boot), and hands back a web-standard
 
 That constraint bit at deploy time: the official Anthropic SDK's entry point
 pulls `node:fs`/`node:path` into the bundle, which the Edge runtime rejects.
-Rather than retreat to the Node runtime, the route speaks the Messages API
-wire format directly — one `fetch` call and a ~25-line SSE line parser. Fewer
+Rather than retreat to the Node runtime, the route speaks the provider wire
+formats directly — one `fetch` call and a ~30-line SSE line parser. Fewer
 moving parts in the bundle, one dependency removed, and "designing around
 serverless constraints" made concrete rather than claimed.
+
+Speaking the wire format also made a second provider nearly free: the route
+supports direct Anthropic (schema-enforced structured output) or any
+OpenAI-compatible gateway such as OpenRouter (JSON contract enforced by
+prompt, with fence-stripping as a guard), selected by whichever key is
+configured. Same forwarder, different delta extractor.
 
 ## 2. One streaming wire format: raw JSON text
 

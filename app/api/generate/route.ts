@@ -6,18 +6,21 @@ import { REPLAY_JSON } from "@/lib/replay";
 // than a fixed invocation window.
 export const runtime = "edge";
 
+// The JSON contract lives in the prompt as well as (on the Anthropic path)
+// the schema, because the OpenRouter path has no server-side enforcement.
 const SYSTEM = `You are a senior brand designer producing a compact brand identity board from a creative brief.
+
+Respond with a single raw JSON object and nothing else: no markdown fences, no commentary. Generate keys in exactly this order:
+{"brand_name", "tagline", "tone_words", "palette", "type_pair", "type_rationale", "voice": {"do", "dont"}, "hero": {"headline", "subheadline", "cta"}, "imagery": {"direction", "keywords"}}
 
 Rules:
 - Ground every choice in the brief. No generic startup styling.
 - tone_words: exactly 5 single words.
-- palette: exactly 5 colors, one per role (background, surface, primary, accent, text).
-  The text color must be clearly readable on the background color. Name colors like a designer, not a paint catalog.
-- type_pair options: "fraunces-archivo" (warm, editorial), "playfair-sourcesans" (classic, refined), "spacegrotesk-plex" (technical, contemporary), "dmserif-worksans" (confident, direct). Pick the one the brief actually calls for.
+- palette: exactly 5 objects {"name", "hex", "role"}, one per role (background, surface, primary, accent, text). The text colour must be clearly readable on the background colour. Name colours like a designer, not a paint catalog.
+- type_pair: one of "fraunces-archivo" (warm, editorial), "playfair-sourcesans" (classic, refined), "spacegrotesk-plex" (technical, contemporary), "dmserif-worksans" (confident, direct). Pick what the brief calls for.
 - voice: exactly 3 "do" and 3 "dont" entries, each a short imperative sentence.
 - hero: headline under 8 words, subheadline one sentence, cta 1-3 words.
-- imagery.keywords: exactly 6 short phrases.
-- Generate fields in the schema's property order.`;
+- imagery: "direction" one or two sentences, "keywords" exactly 6 short phrases.`;
 
 function jsonError(message: string, status: number): Response {
   return new Response(JSON.stringify({ error: message }), {
@@ -39,21 +42,27 @@ export async function POST(req: Request): Promise<Response> {
     return jsonError(`Brief too long (max ${MAX_BRIEF_LENGTH} characters).`, 400);
   }
 
-  if (!process.env.ANTHROPIC_API_KEY) return replayResponse();
-
+  // Provider selection: direct Anthropic if configured, else OpenRouter,
+  // else the recorded replay. Any live failure degrades to replay so the
+  // demo never dead-ends.
   try {
-    return await liveResponse(brief);
+    if (process.env.ANTHROPIC_API_KEY) return await anthropicLive(brief);
+    if (process.env.OPENROUTER_API_KEY) return await openrouterLive(brief);
   } catch {
-    // A failure to even open the stream (bad key, network) degrades to
-    // replay so the demo never dead-ends.
     return replayResponse();
   }
+  return replayResponse();
 }
 
-// The official SDK's entry point drags node:fs/node:path into the Edge
-// bundle, which the Edge runtime rejects — so the route speaks the Messages
-// API wire format directly: one fetch, one small SSE line parser.
-async function liveResponse(brief: string): Promise<Response> {
+interface SseEvent {
+  type?: string;
+  delta?: { type?: string; text?: string };
+  choices?: { delta?: { content?: string } }[];
+}
+
+// Direct Messages API. (The official SDK drags node:fs into the Edge bundle,
+// so both providers are spoken to at the wire level.)
+async function anthropicLive(brief: string): Promise<Response> {
   const upstream = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -72,12 +81,52 @@ async function liveResponse(brief: string): Promise<Response> {
       },
     }),
   });
-
   if (!upstream.ok || !upstream.body) return replayResponse();
 
+  return forwardSse(upstream.body, (e) =>
+    e.type === "content_block_delta" && e.delta?.type === "text_delta"
+      ? e.delta.text
+      : undefined,
+  );
+}
+
+// OpenAI-compatible chat completions via OpenRouter.
+async function openrouterLive(brief: string): Promise<Response> {
+  const upstream = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      "HTTP-Referer": "https://briefboard-ap.vercel.app",
+      "X-Title": "Briefboard",
+    },
+    body: JSON.stringify({
+      model: process.env.BRAND_MODEL ?? "anthropic/claude-opus-4.8",
+      max_tokens: 4096,
+      stream: true,
+      messages: [
+        { role: "system", content: SYSTEM },
+        { role: "user", content: brief },
+      ],
+    }),
+  });
+  if (!upstream.ok || !upstream.body) return replayResponse();
+
+  // No schema enforcement on this path, so strip any markdown fence the
+  // model emits despite instructions. Backticks never occur in valid board
+  // JSON, and the client parser ignores text outside the outermost braces.
+  return forwardSse(upstream.body, (e) =>
+    e.choices?.[0]?.delta?.content?.replaceAll("`", ""),
+  );
+}
+
+function forwardSse(
+  source: ReadableStream<Uint8Array>,
+  extract: (event: SseEvent) => string | undefined,
+): Response {
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
-  const reader = upstream.body.getReader();
+  const reader = source.getReader();
 
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -93,18 +142,11 @@ async function liveResponse(brief: string): Promise<Response> {
             buffer = buffer.slice(nl + 1);
             if (!line.startsWith("data:")) continue;
             const payload = line.slice(5).trim();
-            if (!payload) continue;
+            if (!payload || payload === "[DONE]") continue;
             try {
-              const event = JSON.parse(payload) as {
-                type?: string;
-                delta?: { type?: string; text?: string };
-              };
-              if (
-                event.type === "content_block_delta" &&
-                event.delta?.type === "text_delta" &&
-                typeof event.delta.text === "string"
-              ) {
-                controller.enqueue(encoder.encode(event.delta.text));
+              const text = extract(JSON.parse(payload) as SseEvent);
+              if (typeof text === "string" && text.length > 0) {
+                controller.enqueue(encoder.encode(text));
               }
             } catch {
               // keepalives / partial frames — ignore
