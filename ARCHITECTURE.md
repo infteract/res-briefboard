@@ -9,8 +9,14 @@ is the worst case for classic serverless: the function must live for the whole
 generation (10–30s), most of which is I/O wait. The Edge runtime fits because
 it bills and scales around streaming responses, cold-starts in tens of
 milliseconds (no Node process to boot), and hands back a web-standard
-`ReadableStream` that Next.js passes through untouched. The design constraint
-it imposes — no Node APIs, fetch-based SDK only — costs nothing here.
+`ReadableStream` that Next.js passes through untouched.
+
+That constraint bit at deploy time: the official Anthropic SDK's entry point
+pulls `node:fs`/`node:path` into the bundle, which the Edge runtime rejects.
+Rather than retreat to the Node runtime, the route speaks the Messages API
+wire format directly — one `fetch` call and a ~25-line SSE line parser. Fewer
+moving parts in the bundle, one dependency removed, and "designing around
+serverless constraints" made concrete rather than claimed.
 
 ## 2. One streaming wire format: raw JSON text
 

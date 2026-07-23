@@ -1,4 +1,3 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { BRAND_BOARD_JSON_SCHEMA, MAX_BRIEF_LENGTH } from "@/lib/schema";
 import { REPLAY_JSON } from "@/lib/replay";
 
@@ -43,7 +42,7 @@ export async function POST(req: Request): Promise<Response> {
   if (!process.env.ANTHROPIC_API_KEY) return replayResponse();
 
   try {
-    return liveResponse(brief);
+    return await liveResponse(brief);
   } catch {
     // A failure to even open the stream (bad key, network) degrades to
     // replay so the demo never dead-ends.
@@ -51,25 +50,65 @@ export async function POST(req: Request): Promise<Response> {
   }
 }
 
-function liveResponse(brief: string): Response {
-  const client = new Anthropic();
-  const stream = client.messages.stream({
-    model: process.env.BRAND_MODEL ?? "claude-opus-4-8",
-    max_tokens: 4096,
-    system: SYSTEM,
-    messages: [{ role: "user", content: brief }],
-    output_config: {
-      format: { type: "json_schema", schema: BRAND_BOARD_JSON_SCHEMA },
+// The official SDK's entry point drags node:fs/node:path into the Edge
+// bundle, which the Edge runtime rejects — so the route speaks the Messages
+// API wire format directly: one fetch, one small SSE line parser.
+async function liveResponse(brief: string): Promise<Response> {
+  const upstream = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": process.env.ANTHROPIC_API_KEY as string,
+      "anthropic-version": "2023-06-01",
     },
+    body: JSON.stringify({
+      model: process.env.BRAND_MODEL ?? "claude-opus-4-8",
+      max_tokens: 4096,
+      stream: true,
+      system: SYSTEM,
+      messages: [{ role: "user", content: brief }],
+      output_config: {
+        format: { type: "json_schema", schema: BRAND_BOARD_JSON_SCHEMA },
+      },
+    }),
   });
 
+  if (!upstream.ok || !upstream.body) return replayResponse();
+
   const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const reader = upstream.body.getReader();
+
   const body = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let buffer = "";
       try {
-        for await (const event of stream) {
-          if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
-            controller.enqueue(encoder.encode(event.delta.text));
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let nl: number;
+          while ((nl = buffer.indexOf("\n")) !== -1) {
+            const line = buffer.slice(0, nl).trim();
+            buffer = buffer.slice(nl + 1);
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (!payload) continue;
+            try {
+              const event = JSON.parse(payload) as {
+                type?: string;
+                delta?: { type?: string; text?: string };
+              };
+              if (
+                event.type === "content_block_delta" &&
+                event.delta?.type === "text_delta" &&
+                typeof event.delta.text === "string"
+              ) {
+                controller.enqueue(encoder.encode(event.delta.text));
+              }
+            } catch {
+              // keepalives / partial frames — ignore
+            }
           }
         }
         controller.close();
@@ -77,8 +116,8 @@ function liveResponse(brief: string): Response {
         controller.error(err);
       }
     },
-    cancel() {
-      stream.abort();
+    cancel(reason) {
+      reader.cancel(reason).catch(() => {});
     },
   });
 
